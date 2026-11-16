@@ -12,8 +12,7 @@ jobs:
     name: Start Reyette Windows RDP
     runs-on: windows-2022
     timeout-minutes: 350
-
-    environment: reyette_rdp
+    environment: reyette-rdp
 
     steps:
       # ==========================================
@@ -31,6 +30,8 @@ jobs:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         run: |
+          $ErrorActionPreference = "Stop"
+
           if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
               throw "RDP_PASSWORD secret is missing."
           }
@@ -81,7 +82,7 @@ jobs:
             -Name "MinEncryptionLevel" `
             -Value 3
 
-          # Create RDP user
+          # Create or update RDP user
           $password = ConvertTo-SecureString `
             $env:RDP_PASSWORD `
             -AsPlainText `
@@ -93,26 +94,36 @@ jobs:
               New-LocalUser `
                 -Name "RDP" `
                 -Password $password `
-                -Description "Reyette Remote Desktop User"
+                -Description "Reyette Remote Desktop Administrator"
           } else {
               Set-LocalUser -Name "RDP" -Password $password
           }
 
-          # Add user to Remote Desktop Users
-          $group = Get-LocalGroup -SID "S-1-5-32-555"
+          # Add RDP user to Remote Desktop Users
+          $rdpGroup = Get-LocalGroup -SID "S-1-5-32-555"
 
-          $member = Get-LocalGroupMember -Group $group |
+          $rdpMember = Get-LocalGroupMember -Group $rdpGroup |
               Where-Object { $_.Name -match "\\RDP$" }
 
-          if ($null -eq $member) {
-              Add-LocalGroupMember -Group $group -Member "RDP"
+          if ($null -eq $rdpMember) {
+              Add-LocalGroupMember -Group $rdpGroup -Member "RDP"
+          }
+
+          # Add RDP user to Administrators
+          $adminGroup = Get-LocalGroup -SID "S-1-5-32-544"
+
+          $adminMember = Get-LocalGroupMember -Group $adminGroup |
+              Where-Object { $_.Name -match "\\RDP$" }
+
+          if ($null -eq $adminMember) {
+              Add-LocalGroupMember -Group $adminGroup -Member "RDP"
           }
 
           # Enable Remote Desktop service
           Set-Service -Name TermService -StartupType Automatic
           Start-Service -Name TermService
 
-          Write-Host "RDP configuration completed."
+          Write-Host "RDP user configured as Administrator."
 
       # ==========================================
       # 4. INSTALL TAILSCALE
@@ -140,13 +151,13 @@ jobs:
 
           Remove-Item $installer -Force -ErrorAction SilentlyContinue
 
-          Start-Service -Name Tailscale
-
           $tailscale = "C:\Program Files\Tailscale\tailscale.exe"
 
           if (-not (Test-Path $tailscale)) {
               throw "Tailscale executable not found."
           }
+
+          Start-Service -Name Tailscale
 
           Write-Host "Tailscale installed."
 
@@ -161,7 +172,6 @@ jobs:
           $ErrorActionPreference = "Stop"
 
           $tailscale = "C:\Program Files\Tailscale\tailscale.exe"
-
           $hostname = "reyette-rdp-${{ github.run_id }}"
 
           & $tailscale up `
@@ -174,12 +184,13 @@ jobs:
           }
 
           $connected = $false
+          $ip = $null
 
           for ($i = 0; $i -lt 30; $i++) {
-              $ip = & $tailscale ip -4 2>$null
+              $result = & $tailscale ip -4 2>$null
 
-              if ($LASTEXITCODE -eq 0 -and $ip) {
-                  $ip = ($ip | Select-Object -First 1).Trim()
+              if ($LASTEXITCODE -eq 0 -and $result) {
+                  $ip = ($result | Select-Object -First 1).Trim()
 
                   if ($ip -match '^100\.') {
                       $connected = $true
@@ -215,6 +226,17 @@ jobs:
             -ErrorAction SilentlyContinue |
             Remove-NetFirewallRule
 
+          # Disable standard broad RDP inbound rules
+          Get-NetFirewallRule `
+            -Name "RemoteDesktop-UserMode-In-TCP" `
+            -ErrorAction SilentlyContinue |
+            Disable-NetFirewallRule
+
+          Get-NetFirewallRule `
+            -Name "RemoteDesktop-UserMode-In-UDP" `
+            -ErrorAction SilentlyContinue |
+            Disable-NetFirewallRule
+
           # Allow RDP only from Tailscale IPv4 range
           New-NetFirewallRule `
             -DisplayName "Reyette RDP Tailscale" `
@@ -224,11 +246,6 @@ jobs:
             -RemoteAddress "100.64.0.0/10" `
             -Action Allow `
             -Profile Any
-
-          # Disable broad built-in RDP rules
-          Get-NetFirewallRule -Name "RemoteDesktop-UserMode-In-TCP" `
-            -ErrorAction SilentlyContinue |
-            Disable-NetFirewallRule
 
           Write-Host "RDP firewall configured."
 
@@ -258,7 +275,9 @@ jobs:
 
           Set-Location $env:GITHUB_WORKSPACE
 
-          $installer = Join-Path $env:GITHUB_WORKSPACE "install.ps1"
+          $installer = Join-Path `
+            $env:GITHUB_WORKSPACE `
+            "install.ps1"
 
           if (-not (Test-Path $installer -PathType Leaf)) {
               throw "install.ps1 not found in repository root."
@@ -299,7 +318,18 @@ jobs:
               throw "RDP port 3389 is not listening."
           }
 
+          # Verify Administrator membership
+          $adminGroup = Get-LocalGroup -SID "S-1-5-32-544"
+
+          $adminMember = Get-LocalGroupMember -Group $adminGroup |
+              Where-Object { $_.Name -match "\\RDP$" }
+
+          if (-not $adminMember) {
+              throw "RDP user is not an Administrator."
+          }
+
           Write-Host "RDP service is ready."
+          Write-Host "Administrator membership verified."
 
       # ==========================================
       # 11. DISPLAY CONNECTION INFORMATION
@@ -312,10 +342,11 @@ jobs:
           Write-Host "         REYETTE RDP READY"
           Write-Host "===================================="
           Write-Host ""
-          Write-Host "Address  : $env:TAILSCALE_IP"
-          Write-Host "Port     : 3389"
-          Write-Host "Username : RDP"
-          Write-Host "Password : GitHub Secret RDP_PASSWORD"
+          Write-Host "Address       : $env:TAILSCALE_IP"
+          Write-Host "Port          : 3389"
+          Write-Host "Username      : RDP"
+          Write-Host "Password      : GitHub Environment Secret"
+          Write-Host "User Group    : Administrators"
           Write-Host ""
           Write-Host "Connect using Windows Remote Desktop."
           Write-Host "===================================="
@@ -327,7 +358,7 @@ jobs:
         shell: pwsh
         run: |
           Write-Host "Reyette RDP is running."
-          Write-Host "The session will end when this workflow expires."
+          Write-Host "Session limit: 350 minutes."
 
           while ($true) {
               $service = Get-Service -Name TermService
