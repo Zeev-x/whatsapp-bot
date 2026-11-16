@@ -12,7 +12,7 @@ jobs:
     name: Start Reyette Windows RDP
     runs-on: windows-2022
     timeout-minutes: 350
-    environment: reyette-rdp
+    environment: reyette_rdp
 
     steps:
       # ==========================================
