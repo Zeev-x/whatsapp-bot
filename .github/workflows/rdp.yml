@@ -1,0 +1,338 @@
+
+name: Reyette RDP Server
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rdp:
+    name: Start Reyette Windows RDP
+    runs-on: windows-2022
+    timeout-minutes: 350
+
+    steps:
+      # ==========================================
+      # 1. CHECKOUT REPOSITORY
+      # ==========================================
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # ==========================================
+      # 2. VALIDATE SECRETS
+      # ==========================================
+      - name: Validate Configuration
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+              throw "RDP_PASSWORD secret is missing."
+          }
+
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) {
+              throw "TAILSCALE_AUTHKEY secret is missing."
+          }
+
+          if ($env:RDP_PASSWORD.Length -lt 12) {
+              throw "RDP password must contain at least 12 characters."
+          }
+
+          Write-Host "Configuration validated."
+
+      # ==========================================
+      # 3. CONFIGURE WINDOWS RDP
+      # ==========================================
+      - name: Configure Windows RDP
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "Configuring Windows RDP..."
+
+          # Enable Remote Desktop
+          Set-ItemProperty `
+            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" `
+            -Name "fDenyTSConnections" `
+            -Value 0
+
+          # Require Network Level Authentication
+          Set-ItemProperty `
+            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
+            -Name "UserAuthentication" `
+            -Value 1
+
+          # Require TLS security layer
+          Set-ItemProperty `
+            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
+            -Name "SecurityLayer" `
+            -Value 2
+
+          # High encryption level
+          Set-ItemProperty `
+            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
+            -Name "MinEncryptionLevel" `
+            -Value 3
+
+          # Create RDP user
+          $password = ConvertTo-SecureString `
+            $env:RDP_PASSWORD `
+            -AsPlainText `
+            -Force
+
+          $user = Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue
+
+          if ($null -eq $user) {
+              New-LocalUser `
+                -Name "RDP" `
+                -Password $password `
+                -Description "Reyette Remote Desktop User"
+          } else {
+              Set-LocalUser -Name "RDP" -Password $password
+          }
+
+          # Add user to Remote Desktop Users
+          $group = Get-LocalGroup -SID "S-1-5-32-555"
+
+          $member = Get-LocalGroupMember -Group $group |
+              Where-Object { $_.Name -match "\\RDP$" }
+
+          if ($null -eq $member) {
+              Add-LocalGroupMember -Group $group -Member "RDP"
+          }
+
+          # Enable Remote Desktop service
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service -Name TermService
+
+          Write-Host "RDP configuration completed."
+
+      # ==========================================
+      # 4. INSTALL TAILSCALE
+      # ==========================================
+      - name: Install Tailscale
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $installer = "$env:TEMP\tailscale-setup.msi"
+
+          Invoke-WebRequest `
+            -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
+            -OutFile $installer
+
+          $process = Start-Process `
+            -FilePath "msiexec.exe" `
+            -ArgumentList "/i `"$installer`" /qn /norestart" `
+            -Wait `
+            -PassThru
+
+          if ($process.ExitCode -notin @(0, 3010)) {
+              throw "Tailscale installation failed: $($process.ExitCode)"
+          }
+
+          Remove-Item $installer -Force -ErrorAction SilentlyContinue
+
+          Start-Service -Name Tailscale
+
+          $tailscale = "C:\Program Files\Tailscale\tailscale.exe"
+
+          if (-not (Test-Path $tailscale)) {
+              throw "Tailscale executable not found."
+          }
+
+          Write-Host "Tailscale installed."
+
+      # ==========================================
+      # 5. CONNECT TAILSCALE
+      # ==========================================
+      - name: Connect Tailscale
+        shell: pwsh
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $tailscale = "C:\Program Files\Tailscale\tailscale.exe"
+
+          $hostname = "reyette-rdp-${{ github.run_id }}"
+
+          & $tailscale up `
+            "--authkey=$env:TAILSCALE_AUTHKEY" `
+            "--hostname=$hostname" `
+            "--accept-routes=false"
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Failed to connect to Tailscale."
+          }
+
+          $connected = $false
+
+          for ($i = 0; $i -lt 30; $i++) {
+              $ip = & $tailscale ip -4 2>$null
+
+              if ($LASTEXITCODE -eq 0 -and $ip) {
+                  $ip = ($ip | Select-Object -First 1).Trim()
+
+                  if ($ip -match '^100\.') {
+                      $connected = $true
+                      break
+                  }
+              }
+
+              Start-Sleep -Seconds 2
+          }
+
+          if (-not $connected) {
+              throw "Unable to obtain Tailscale IPv4 address."
+          }
+
+          "TAILSCALE_IP=$ip" | Out-File `
+            -FilePath $env:GITHUB_ENV `
+            -Append
+
+          Write-Host "Tailscale connected."
+          Write-Host "RDP IP: $ip"
+
+      # ==========================================
+      # 6. CONFIGURE FIREWALL
+      # ==========================================
+      - name: Configure RDP Firewall
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          # Remove previous custom rule
+          Get-NetFirewallRule `
+            -DisplayName "Reyette RDP Tailscale" `
+            -ErrorAction SilentlyContinue |
+            Remove-NetFirewallRule
+
+          # Allow RDP only from Tailscale IPv4 range
+          New-NetFirewallRule `
+            -DisplayName "Reyette RDP Tailscale" `
+            -Direction Inbound `
+            -Protocol TCP `
+            -LocalPort 3389 `
+            -RemoteAddress "100.64.0.0/10" `
+            -Action Allow `
+            -Profile Any
+
+          # Disable broad built-in RDP rules
+          Get-NetFirewallRule -Name "RemoteDesktop-UserMode-In-TCP" `
+            -ErrorAction SilentlyContinue |
+            Disable-NetFirewallRule
+
+          Write-Host "RDP firewall configured."
+
+      # ==========================================
+      # 7. SETUP PYTHON
+      # ==========================================
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # ==========================================
+      # 8. SETUP NODE.JS
+      # ==========================================
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # ==========================================
+      # 9. EXECUTE ROOT INSTALLER
+      # ==========================================
+      - name: Execute Repository Installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Set-Location $env:GITHUB_WORKSPACE
+
+          $installer = Join-Path $env:GITHUB_WORKSPACE "install.ps1"
+
+          if (-not (Test-Path $installer -PathType Leaf)) {
+              throw "install.ps1 not found in repository root."
+          }
+
+          Write-Host "===================================="
+          Write-Host "       REYETTE BOOTSTRAP"
+          Write-Host "===================================="
+
+          & $installer
+
+          if (-not $?) {
+              throw "Repository installer failed."
+          }
+
+          Write-Host "Repository installer completed."
+
+      # ==========================================
+      # 10. VERIFY RDP
+      # ==========================================
+      - name: Verify RDP Service
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $service = Get-Service -Name TermService
+
+          if ($service.Status -ne "Running") {
+              throw "Remote Desktop service is not running."
+          }
+
+          $listener = Get-NetTCPConnection `
+            -LocalPort 3389 `
+            -State Listen `
+            -ErrorAction SilentlyContinue
+
+          if (-not $listener) {
+              throw "RDP port 3389 is not listening."
+          }
+
+          Write-Host "RDP service is ready."
+
+      # ==========================================
+      # 11. DISPLAY CONNECTION INFORMATION
+      # ==========================================
+      - name: Display RDP Information
+        shell: pwsh
+        run: |
+          Write-Host ""
+          Write-Host "===================================="
+          Write-Host "         REYETTE RDP READY"
+          Write-Host "===================================="
+          Write-Host ""
+          Write-Host "Address  : $env:TAILSCALE_IP"
+          Write-Host "Port     : 3389"
+          Write-Host "Username : RDP"
+          Write-Host "Password : GitHub Secret RDP_PASSWORD"
+          Write-Host ""
+          Write-Host "Connect using Windows Remote Desktop."
+          Write-Host "===================================="
+
+      # ==========================================
+      # 12. KEEP RUNNER ALIVE
+      # ==========================================
+      - name: Keep RDP Session Alive
+        shell: pwsh
+        run: |
+          Write-Host "Reyette RDP is running."
+          Write-Host "The session will end when this workflow expires."
+
+          while ($true) {
+              $service = Get-Service -Name TermService
+
+              if ($service.Status -ne "Running") {
+                  Start-Service -Name TermService
+              }
+
+              Start-Sleep -Seconds 60
+          }
