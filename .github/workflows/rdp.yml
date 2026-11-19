@@ -126,6 +126,119 @@ jobs:
           Write-Host "RDP user configured as Administrator."
 
       # ==========================================
+      # 3.1. CONFIGURE HARDWARE GPU RENDERING
+      # ==========================================
+      - name: Configure Hardware GPU Rendering
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "Configuring hardware graphics..."
+
+          $registryPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
+
+          # Create registry path
+          if (-not (Test-Path $registryPath)) {
+              New-Item -Path $registryPath -Force | Out-Null
+          }
+
+          # Prefer hardware graphics adapters
+          New-ItemProperty `
+            -Path $registryPath `
+            -Name "bEnumerateHWBeforeSW" `
+            -PropertyType DWord `
+            -Value 1 `
+            -Force | Out-Null
+
+          # Enable WDDM graphics driver
+          New-ItemProperty `
+            -Path $registryPath `
+            -Name "fEnableWddmDriver" `
+            -PropertyType DWord `
+            -Value 1 `
+            -Force | Out-Null
+
+          # Prefer H.264 hardware encoding
+          New-ItemProperty `
+            -Path $registryPath `
+            -Name "AVCHardwareEncodePreferred" `
+            -PropertyType DWord `
+            -Value 1 `
+            -Force | Out-Null
+
+          # Prefer AVC444 graphics mode
+          New-ItemProperty `
+            -Path $registryPath `
+            -Name "AVC444ModePreferred" `
+            -PropertyType DWord `
+            -Value 1 `
+            -Force | Out-Null
+
+          Write-Host "[SUCCESS] Hardware GPU preference enabled."
+          Write-Host "[SUCCESS] WDDM driver enabled."
+          Write-Host "[SUCCESS] H.264 hardware encoding preferred."
+          Write-Host "[SUCCESS] AVC444 graphics mode preferred."
+
+      # ==========================================
+      # 3.2. VERIFY GPU CONFIGURATION
+      # ==========================================
+      - name: Verify Hardware Graphics
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $registryPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
+
+          $policies = @(
+              "bEnumerateHWBeforeSW",
+              "fEnableWddmDriver",
+              "AVCHardwareEncodePreferred",
+              "AVC444ModePreferred"
+          )
+
+          foreach ($policy in $policies) {
+              $value = Get-ItemPropertyValue `
+                  -Path $registryPath `
+                  -Name $policy
+
+              if ($value -ne 1) {
+                  throw "GPU policy verification failed: $policy"
+              }
+
+              Write-Host "[SUCCESS] $policy = $value"
+          }
+
+          Write-Host ""
+          Write-Host "Detecting graphics adapters..."
+
+          $adapters = Get-CimInstance Win32_VideoController
+
+          $hardwareGPU = $false
+
+          foreach ($adapter in $adapters) {
+              Write-Host "--------------------------------"
+              Write-Host "GPU          : $($adapter.Name)"
+              Write-Host "Driver       : $($adapter.DriverVersion)"
+              Write-Host "Video Proc.  : $($adapter.VideoProcessor)"
+              Write-Host "Status       : $($adapter.Status)"
+
+              if ($adapter.Name -match "NVIDIA|AMD|Radeon|Intel") {
+                  $hardwareGPU = $true
+              }
+          }
+
+          Write-Host "--------------------------------"
+
+          if ($hardwareGPU) {
+              Write-Host "[SUCCESS] Hardware GPU detected."
+          } else {
+              Write-Warning "No NVIDIA, AMD or Intel hardware GPU detected."
+              Write-Warning "RDP will use the best available graphics adapter."
+          }
+
+          Write-Host "GPU policy verification completed."
+
+      # ==========================================
       # 4. INSTALL TAILSCALE
       # ==========================================
       - name: Install Tailscale
@@ -296,7 +409,7 @@ jobs:
           Write-Host "Repository installer completed."
 
       # ==========================================
-      # 10. VERIFY RDP
+      # 10. VERIFY RDP SERVICE
       # ==========================================
       - name: Verify RDP Service
         shell: pwsh
@@ -347,6 +460,9 @@ jobs:
           Write-Host "Username      : RDP"
           Write-Host "Password      : GitHub Environment Secret"
           Write-Host "User Group    : Administrators"
+          Write-Host "Graphics      : Hardware GPU Preferred"
+          Write-Host "WDDM          : Enabled"
+          Write-Host "AVC Encoding  : Hardware Preferred"
           Write-Host ""
           Write-Host "Connect using Windows Remote Desktop."
           Write-Host "===================================="
